@@ -26,6 +26,9 @@ import dotenv from "dotenv";
 import axios from "axios";
 import OAuth from "oauth-1.0a";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 dotenv.config({ path: "./.env", quiet: true });
 
@@ -68,6 +71,9 @@ const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
 const MAX_DELETE_FRACTION = 0.25; // 25% of Discogs-linked Shopify products
 const MIN_DELETE_LIMIT = 10;      // ...but always allow at least this many
 const MAX_DRAFTS_PER_RUN = 25;
+
+// How many existing products get their genres filled in per run.
+const GENRE_BACKFILL_PER_RUN = Number(process.env.GENRE_BACKFILL_PER_RUN) || 60;
 
 const DISCOGS_BASE = process.env.DISCOGS_API_BASE || "https://api.discogs.com";
 const SHOPIFY_BASE =
@@ -409,24 +415,152 @@ async function fetchForSaleInventory(username) {
   return all.filter((l) => !l.status || l.status === "For Sale");
 }
 
-async function getDiscogsImage(releaseId) {
+// ---------- DISCOGS RELEASE DETAILS (genres, styles, images) ----------
+const releaseCache = new Map();
+async function getRelease(releaseId) {
+  if (releaseCache.has(releaseId)) return releaseCache.get(releaseId);
+  let data = null;
   try {
     const res = await api.get(`/releases/${releaseId}`);
-    return res.data.images?.[0]?.uri || res.data.images?.[0]?.uri150 || null;
+    data = {
+      image: res.data.images?.[0]?.uri || res.data.images?.[0]?.uri150 || null,
+      genres: res.data.genres || [],
+      styles: res.data.styles || [],
+    };
   } catch (err) {
-    console.log("  ❌ Discogs image lookup failed:", err.response?.data || err.message);
+    console.log("  ❌ Discogs release lookup failed:", err.response?.data || err.message);
+  }
+  releaseCache.set(releaseId, data);
+  await sleep(1100); // stay under Discogs' 60 requests/minute
+  return data;
+}
+
+// ---------- GENRE -> COLLECTION MAPPING (genre-map.json) ----------
+const GENRE_MAP = (() => {
+  const file = path.join(path.dirname(fileURLToPath(import.meta.url)), "genre-map.json");
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    console.log(`⚠️ Couldn't read genre-map.json (${err.message}) — genre collections will be skipped.`);
     return null;
   }
+})();
+
+const lc = (s) => String(s || "").trim().toLowerCase();
+
+function genreCollectionsFor(release) {
+  const out = new Set();
+  if (!GENRE_MAP || !release) return [];
+  const genreMap = Object.fromEntries(Object.entries(GENRE_MAP.genres || {}).map(([k, v]) => [lc(k), v]));
+  const styleMap = Object.fromEntries(Object.entries(GENRE_MAP.styles || {}).map(([k, v]) => [lc(k), v]));
+  const contains = Object.entries(GENRE_MAP.styleContains || {});
+
+  for (const g of release.genres) for (const c of genreMap[lc(g)] || []) out.add(c);
+  for (const st of release.styles) {
+    for (const c of styleMap[lc(st)] || []) out.add(c);
+    for (const [needle, cols] of contains) {
+      if (lc(st).includes(lc(needle))) for (const c of cols) out.add(c);
+    }
+  }
+  for (const [genre, rule] of Object.entries(GENRE_MAP.fallbacks || {})) {
+    if (!release.genres.some((g) => lc(g) === lc(genre))) continue;
+    const already = (rule.ifNoneOf || []).some((c) => [...out].some((o) => lc(o) === lc(c)));
+    if (!already) for (const c of rule.use || []) out.add(c);
+  }
+  return [...out];
+}
+
+// ---------- SHOPIFY COLLECTIONS ----------
+// Loaded once per run: manual ("custom") and automated ("smart") collections.
+let collectionIndex = null;
+const warnedCollections = new Set();
+
+async function loadCollections() {
+  if (collectionIndex) return collectionIndex;
+  collectionIndex = new Map();
+  const custom = await shopifyGetAll("/custom_collections.json", "custom_collections", { fields: "id,title" });
+  for (const c of custom) collectionIndex.set(lc(c.title), { id: c.id, title: c.title, smart: false });
+  try {
+    const smart = await shopifyGetAll("/smart_collections.json", "smart_collections", { fields: "id,title,rules" });
+    for (const c of smart) {
+      const tagRule = (c.rules || []).find((r) => r.column === "tag" && r.relation === "equals");
+      collectionIndex.set(lc(c.title), { id: c.id, title: c.title, smart: true, tag: tagRule?.condition || null });
+    }
+  } catch (err) {
+    console.log("  ⚠️ Couldn't load automated collections:", err.response?.status || err.message);
+  }
+  console.log(`Shopify: ${collectionIndex.size} collection(s) found.`);
+  return collectionIndex;
+}
+
+function warnOnce(key, msg) {
+  if (warnedCollections.has(key)) return;
+  warnedCollections.add(key);
+  console.log(`  ⚠️ ${msg}`);
+}
+
+// Works out how to put a product into the given collection titles:
+//   manual collections  -> collection IDs to add the product to
+//   automated (by tag)  -> tags to add to the product
+async function planCollections(titles) {
+  const index = await loadCollections();
+  const collectIds = [];
+  const tags = [];
+  const names = [];
+  for (const title of titles) {
+    const col = index.get(lc(title));
+    if (!col) {
+      warnOnce(title, `Collection "${title}" not found in Shopify — check the name in genre-map.json`);
+      continue;
+    }
+    if (!col.smart) {
+      collectIds.push(col.id);
+      names.push(col.title);
+    } else if (col.tag) {
+      tags.push(col.tag);
+      names.push(col.title);
+    } else {
+      warnOnce(title, `"${title}" is an automated collection without a "tag equals" rule — can't add products to it`);
+    }
+  }
+  return { collectIds, tags, names };
+}
+
+async function addProductToCollection(productId, collectionId) {
+  try {
+    await shopify.post("/collects.json", {
+      collect: { product_id: productId, collection_id: collectionId },
+    });
+    return true;
+  } catch (err) {
+    // 422 = already in that collection, which is fine
+    if (err.response?.status === 422) return true;
+    console.log("  ❌ Collection assignment failed:", err.response?.data || err.message);
+    return false;
+  }
+}
+
+const GENRE_DONE_TAG = "genres-synced";
+
+function splitTags(tags) {
+  return String(tags || "").split(",").map((t) => t.trim()).filter(Boolean);
+}
+
+function mergeTags(existing, extra) {
+  const out = [...existing];
+  for (const t of extra) if (!out.some((e) => lc(e) === lc(t))) out.push(t);
+  return out;
 }
 
 async function mapToShopify(listing) {
   const r = listing.release;
-  let image = r.cover_image;
-  if (!image) image = await getDiscogsImage(r.id);
+  const release = await getRelease(r.id);
+  const image = r.cover_image || release?.image || null;
 
   const format = r.format || r.formats || r.format_description;
   const { weight, weight_unit } = getWeightForFormat(format);
-  const collection = getCollectionForFormat(format);
+  const formatCollection = getCollectionForFormat(format);
+  const genreCollections = genreCollectionsFor(release);
 
   const product = {
     title: `${r.artist} - ${r.title}`,
@@ -438,7 +572,7 @@ async function mapToShopify(listing) {
       <p><strong>Discogs ID:</strong> ${listing.id}</p>
     `,
     vendor: r.label || r.artist || "Unknown",
-    product_type: collection === "CDs" ? "CD" : "Vinyl",
+    product_type: formatCollection === "CDs" ? "CD" : "Vinyl",
     variants: [
       {
         price: listing.price.value,
@@ -453,34 +587,7 @@ async function mapToShopify(listing) {
 
   if (image) product.images = [{ src: image }];
 
-  return { product, collection };
-}
-
-const collectionIdCache = new Map();
-async function getCollectionIdByTitle(title) {
-  if (collectionIdCache.has(title)) return collectionIdCache.get(title);
-  try {
-    const res = await shopify.get("/custom_collections.json", { params: { title } });
-    const id = res.data.custom_collections?.[0]?.id || null;
-    if (!id) console.log(`  ⚠️ Collection "${title}" not found`);
-    collectionIdCache.set(title, id);
-    return id;
-  } catch (err) {
-    console.log("  ❌ Collection lookup failed:", err.response?.data || err.message);
-    return null;
-  }
-}
-
-async function addProductToCollection(productId, collectionId) {
-  try {
-    const res = await shopify.post("/collects.json", {
-      collect: { product_id: productId, collection_id: collectionId },
-    });
-    return res.data.collect;
-  } catch (err) {
-    console.log("  ❌ Collection assignment failed:", err.response?.data || err.message);
-    return null;
-  }
+  return { product, collections: [formatCollection, ...genreCollections], genreCollections, release };
 }
 
 async function createShopifyProduct(product) {
@@ -516,8 +623,12 @@ async function createNewProducts(listings, existingBySku) {
     const mapped = await mapToShopify(listing);
     console.log(`\n[${index}/${toCreate.length}] ${mapped.product.title}`);
 
+    const plan = await planCollections(mapped.collections);
+    if (mapped.genreCollections.length) console.log(`  Genres: ${mapped.genreCollections.join(", ")}`);
+    mapped.product.tags = mergeTags(plan.tags, [GENRE_DONE_TAG]).join(", ");
+
     if (DRY_RUN) {
-      console.log("  (dry run) would create product");
+      console.log(`  (dry run) would create product in: ${plan.names.join(", ") || "no collections"}`);
       continue;
     }
 
@@ -525,10 +636,8 @@ async function createNewProducts(listings, existingBySku) {
     if (product) {
       created++;
       console.log(`  ✔ Created Shopify ID: ${product.id}`);
-      const collectionId = await getCollectionIdByTitle(mapped.collection);
-      if (collectionId && (await addProductToCollection(product.id, collectionId))) {
-        console.log(`  ✔ Added to collection: ${mapped.collection}`);
-      }
+      for (const id of plan.collectIds) await addProductToCollection(product.id, id);
+      if (plan.names.length) console.log(`  ✔ Collections: ${plan.names.join(", ")}`);
     }
     await sleep(800);
   }
@@ -555,22 +664,80 @@ async function removeProductsNotForSale(forSaleSkus, allProducts) {
     for (const p of stale.slice(0, 20)) console.log(`   - ${p.title}`);
     if (stale.length > 20) console.log(`   ...and ${stale.length - 20} more`);
     problems.push(msg);
-    return;
+    return new Set();
   }
 
   let removed = 0;
+  const deletedIds = new Set();
   for (const product of stale) {
     const sku = product.variants.find((v) => isDiscogsSku(v.sku))?.sku;
     console.log(`🗑️ "${product.title}" (SKU ${sku}) — no longer for sale on Discogs`);
     if (DRY_RUN) continue;
     if (await deleteShopifyProduct(product.id)) {
       removed++;
+      deletedIds.add(product.id);
       console.log("  ✔ Deleted");
     }
     await sleep(500);
   }
 
   if (!DRY_RUN) console.log(`Removed ${removed} product(s).`);
+  return deletedIds;
+}
+
+// ============================================================
+// STEP 4: FILL IN GENRES FOR EXISTING PRODUCTS
+// ============================================================
+// Products created before genre support get sorted into genre collections a
+// batch at a time (Discogs allows ~1 lookup per second), then tagged
+// "genres-synced" so they're never looked up again.
+async function backfillGenres(listings, allProducts, deletedIds) {
+  console.log("\n== Step 4: Genre collections for existing products ==");
+
+  const listingBySku = new Map(listings.map((l) => [String(l.id), l]));
+  const todo = allProducts.filter((p) => {
+    if (deletedIds.has(p.id)) return false;
+    if (splitTags(p.tags).some((t) => lc(t) === GENRE_DONE_TAG)) return false;
+    return (p.variants || []).some((v) => listingBySku.has(v.sku));
+  });
+
+  if (!todo.length) {
+    console.log("All products already have their genres.");
+    return;
+  }
+
+  const batch = todo.slice(0, GENRE_BACKFILL_PER_RUN);
+  console.log(`${todo.length} product(s) still need genres; doing ${batch.length} this run.`);
+
+  let done = 0;
+  for (const product of batch) {
+    const sku = product.variants.find((v) => listingBySku.has(v.sku)).sku;
+    const listing = listingBySku.get(sku);
+    const release = await getRelease(listing.release.id);
+    if (!release) continue; // lookup failed; try again next run
+
+    const titles = genreCollectionsFor(release);
+    const plan = await planCollections(titles);
+    console.log(`  🎵 "${product.title}": ${plan.names.join(", ") || "(no matching genre collection)"}` +
+      (release.genres.length ? `  [Discogs: ${[...release.genres, ...release.styles].join(", ")}]` : ""));
+
+    if (DRY_RUN) continue;
+
+    for (const id of plan.collectIds) await addProductToCollection(product.id, id);
+    const tags = mergeTags(splitTags(product.tags), [...plan.tags, GENRE_DONE_TAG]);
+    try {
+      await shopify.put(`/products/${product.id}.json`, { product: { id: product.id, tags: tags.join(", ") } });
+      done++;
+    } catch (err) {
+      console.log("  ❌ Couldn't update tags:", err.response?.data || err.message);
+    }
+    await sleep(500);
+  }
+
+  if (!DRY_RUN) {
+    console.log(`Sorted ${done} product(s) into genres.` +
+      (todo.length > batch.length ? ` ${todo.length - done} left — they'll be done over the next runs.` : ""));
+  }
 }
 
 // ============================================================
@@ -592,7 +759,7 @@ async function main() {
   console.log(`Discogs: ${listings.length} listing(s) for sale.`);
 
   const allProducts = await shopifyGetAll("/products.json", "products", {
-    fields: "id,title,variants",
+    fields: "id,title,tags,variants",
   });
   console.log(`Shopify: ${allProducts.length} product(s).`);
 
@@ -613,7 +780,11 @@ async function main() {
   await createNewProducts(listings, existingBySku);
 
   const forSaleSkus = new Set(listings.map((l) => String(l.id)));
-  await removeProductsNotForSale(forSaleSkus, allProducts);
+  const deletedIds = await removeProductsNotForSale(forSaleSkus, allProducts);
+
+  // Products sold/removed on Discogs are skipped automatically: they're not in
+  // the For Sale listings, so there's nothing to look up for them.
+  await backfillGenres(listings, allProducts, deletedIds);
 }
 
 main()

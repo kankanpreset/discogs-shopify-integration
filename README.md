@@ -10,6 +10,8 @@ Each run:
 2. **New on Discogs → added to Shopify.** Every *For Sale* Discogs listing that isn't on Shopify yet is created as a product (with image, weight, and CDs/Vinyl collection).
 3. **Gone from Discogs → removed from Shopify.** Any Shopify product linked to a Discogs listing that is no longer *For Sale* (sold, drafted, or deleted on Discogs) is deleted from Shopify.
 
+4. **Genres → collections.** Each record is looked up on Discogs and added to **every** matching genre collection (Rock, Soul, Metal, Folk…). New products get this when they're created; products that were already on the store are filled in about 60 per run until they're all done, then tagged `genres-synced` so they're not looked up again.
+
 Products are linked by SKU: the Shopify SKU is the Discogs listing ID. Products without a numeric SKU (merch, etc.) are never touched.
 
 ### Safety checks
@@ -50,6 +52,19 @@ In the Shopify Dev Dashboard, the app's active version needs these scopes:
 ### 3. Do a test run
 
 **Actions** tab → **Discogs <-> Shopify sync** → **Run workflow** → tick **Dry run** → **Run workflow**. Open the run to see what it *would* do. If it looks right, run it again without Dry run. After that it runs on its own every 15 minutes.
+
+## Changing which genre goes where
+
+Edit `genre-map.json` on GitHub (click it → pencil icon). It has four parts:
+
+- **`genres`** — Discogs' broad genres (Rock, Funk / Soul, Hip Hop…) → your collection names.
+- **`styles`** — Discogs' specific styles (Bossa Nova, Ska, Country Rock…) → your collection names.
+- **`styleContains`** — any style containing this word (e.g. every "...Metal" style → Metal).
+- **`fallbacks`** — e.g. a record marked only "Folk, World, & Country" with no clearer style goes to Folk.
+
+Collection names must match Shopify exactly. Manual collections get products added directly; automated collections work if their condition is "Product tag is equal to …" (the sync adds that tag). The run log shows which collections each record went into, and warns about any name it can't find.
+
+Changes only affect records sorted from then on. To re-sort a record, remove its `genres-synced` tag in Shopify and it will be redone on the next run.
 
 ## Changing how often it runs
 

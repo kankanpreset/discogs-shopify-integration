@@ -1,0 +1,56 @@
+{
+  "_help": "Maps Discogs genres and styles to your Shopify collection names. A record goes into EVERY collection it matches. Edit freely: collection names must match Shopify exactly. Discogs genres: https://www.discogs.com/search/?type=release (see the Genre and Style filters).",
+
+  "genres": {
+    "Rock": ["Rock"],
+    "Pop": ["Pop"],
+    "Jazz": ["Jazz"],
+    "Blues": ["Blues"],
+    "Classical": ["Classical"],
+    "Electronic": ["Electronic"],
+    "Hip Hop": ["Hip-hop"],
+    "Latin": ["Latin"],
+    "Reggae": ["Reggae"],
+    "Funk / Soul": ["Soul"],
+    "Stage & Screen": ["Soundtrack"],
+    "Folk, World, & Country": []
+  },
+
+  "styles": {
+    "Country": ["Country"],
+    "Country Rock": ["Country"],
+    "Bluegrass": ["Country"],
+    "Honky Tonk": ["Country"],
+    "Western Swing": ["Country"],
+    "Cajun": ["Country"],
+    "Folk": ["Folk"],
+    "Folk Rock": ["Folk"],
+    "Acoustic": ["Folk"],
+    "Celtic": ["Folk"],
+    "Soundtrack": ["Soundtrack"],
+    "Score": ["Soundtrack"],
+    "Musical": ["Soundtrack"],
+    "Ska": ["Reggae"],
+    "Rocksteady": ["Reggae"],
+    "Dub": ["Reggae"],
+    "Bossa Nova": ["Latin"],
+    "Salsa": ["Latin"],
+    "Blues Rock": ["Blues"],
+    "Soul": ["Soul"],
+    "Rhythm & Blues": ["Soul"],
+    "Grindcore": ["Metal"],
+    "Oi": ["Punk"]
+  },
+
+  "_styleContains_help": "Any style containing this text goes into these collections (e.g. 'Heavy Metal', 'Thrash' needs its own line).",
+  "styleContains": {
+    "Metal": ["Metal"],
+    "Thrash": ["Metal"],
+    "Punk": ["Punk"]
+  },
+
+  "_fallbacks_help": "If a record has this Discogs genre but none of the listed collections were matched by its styles, use these instead.",
+  "fallbacks": {
+    "Folk, World, & Country": { "ifNoneOf": ["Folk", "Country"], "use": ["Folk"] }
+  }
+}
