@@ -1,0 +1,55 @@
+name: Discogs <-> Shopify sync
+
+on:
+  schedule:
+    # Every 30 minutes. If this repo is PUBLIC, you can change this to
+    # "*/15 * * * *" for every 15 minutes (public repos get free minutes).
+    # GitHub sometimes starts scheduled runs a few minutes late.
+    - cron: "*/30 * * * *"
+
+  # Adds a "Run workflow" button on the Actions tab.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — only show what would change"
+        type: boolean
+        default: false
+      allow_mass_delete:
+        description: "Allow mass delete — skip the safety check on large deletions"
+        type: boolean
+        default: false
+
+# Never let two syncs run at the same time.
+concurrency:
+  group: discogs-shopify-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run sync
+        run: node sync.js
+        env:
+          DISCOGS_CONSUMER_KEY: ${{ secrets.DISCOGS_CONSUMER_KEY }}
+          DISCOGS_CONSUMER_SECRET: ${{ secrets.DISCOGS_CONSUMER_SECRET }}
+          DISCOGS_ACCESS_TOKEN: ${{ secrets.DISCOGS_ACCESS_TOKEN }}
+          DISCOGS_ACCESS_SECRET: ${{ secrets.DISCOGS_ACCESS_SECRET }}
+          DISCOGS_USER: ${{ secrets.DISCOGS_USER }}
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ALLOW_MASS_DELETE: ${{ inputs.allow_mass_delete }}
