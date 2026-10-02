@@ -1,6 +1,6 @@
 # Discogs ↔ Shopify Sync (Barnhouse Vinyl)
 
-Keeps the Shopify store and the Discogs marketplace inventory in step, automatically, every 30 minutes via GitHub Actions.
+Keeps the Shopify store and the Discogs marketplace inventory in step, automatically, every 15 minutes via GitHub Actions.
 
 ## What it does
 
@@ -34,24 +34,29 @@ In this repo on GitHub: **Settings → Secrets and variables → Actions → New
 | `DISCOGS_ACCESS_SECRET` | from `.env` |
 | `DISCOGS_USER` | your Discogs username |
 | `SHOPIFY_STORE` | `yourstore.myshopify.com` |
-| `SHOPIFY_TOKEN` | from `.env` |
+| `SHOPIFY_CLIENT_ID` | Dev Dashboard → your app → **Settings** → Client ID |
+| `SHOPIFY_CLIENT_SECRET` | Dev Dashboard → your app → **Settings** → Client secret |
 
 Never upload the `.env` file itself.
 
-### 2. Let the Shopify app read orders
+The sync uses the Client ID/secret to get a fresh Shopify access token at the start of every run (Dev Dashboard tokens expire after 24 hours). A fixed `SHOPIFY_TOKEN` secret still works for old-style custom apps, but isn't needed.
 
-The sync now reads orders to see what sold. In Shopify admin: **Settings → Apps and sales channels → Develop apps →** (your app) **→ Configuration → Admin API integration**, make sure **`read_orders`** is ticked (alongside the product permissions it already has), and save. If Shopify asks you to reinstall the app and gives you a new token, update the `SHOPIFY_TOKEN` secret.
+### 2. Shopify app permissions
+
+In the Shopify Dev Dashboard, the app's active version needs these scopes:
+`read_products,write_products,read_inventory,write_inventory,read_orders`
+(To change them: **Versions → Create version**, edit **Scopes**, **Release**, then approve the update in the store admin.) The sync checks these at the start of each run and says which are missing.
 
 ### 3. Do a test run
 
-**Actions** tab → **Discogs <-> Shopify sync** → **Run workflow** → tick **Dry run** → **Run workflow**. Open the run to see what it *would* do. If it looks right, run it again without Dry run. After that it runs on its own every 30 minutes.
+**Actions** tab → **Discogs <-> Shopify sync** → **Run workflow** → tick **Dry run** → **Run workflow**. Open the run to see what it *would* do. If it looks right, run it again without Dry run. After that it runs on its own every 15 minutes.
 
 ## Changing how often it runs
 
 Edit `.github/workflows/sync.yml` and change the `cron` line:
 
-- `*/30 * * * *` — every 30 minutes (default; fits GitHub's free minutes for private repos)
-- `*/15 * * * *` — every 15 minutes (fine for **public** repos, which have free unlimited minutes)
+- `*/15 * * * *` — every 15 minutes (default; fine for **public** repos, which have free unlimited minutes)
+- `*/30 * * * *` — every 30 minutes (use this if the repo is **private**, to fit GitHub's free minutes)
 
 GitHub can start scheduled runs a few minutes late at busy times. Because Discogs has no instant sale notifications, there's always a short window where a record could sell on both sites; the double-sale warning covers that.
 

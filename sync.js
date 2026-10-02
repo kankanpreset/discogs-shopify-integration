@@ -13,7 +13,9 @@
 // Environment variables (GitHub secrets, or a local .env file):
 //   DISCOGS_CONSUMER_KEY, DISCOGS_CONSUMER_SECRET,
 //   DISCOGS_ACCESS_TOKEN, DISCOGS_ACCESS_SECRET, DISCOGS_USER,
-//   SHOPIFY_STORE, SHOPIFY_TOKEN
+//   SHOPIFY_STORE, and either
+//     SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET  (Dev Dashboard app — recommended)
+//     or SHOPIFY_TOKEN                           (legacy custom app token)
 // Optional:
 //   DRY_RUN=true            log what would happen, change nothing
 //   ALLOW_MASS_DELETE=true  skip the safety check on large deletions
@@ -35,10 +37,19 @@ const REQUIRED_ENV = [
   "DISCOGS_ACCESS_SECRET",
   "DISCOGS_USER",
   "SHOPIFY_STORE",
-  "SHOPIFY_TOKEN",
 ];
 
+// Shopify login: either a Client ID + Client Secret (Dev Dashboard apps —
+// a fresh 24-hour token is fetched at the start of every run), or a fixed
+// SHOPIFY_TOKEN (legacy custom apps).
+const USE_CLIENT_CREDENTIALS = !!(
+  process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET
+);
+
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
+if (!USE_CLIENT_CREDENTIALS && !process.env.SHOPIFY_TOKEN) {
+  missing.push("SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (or SHOPIFY_TOKEN)");
+}
 if (missing.length) {
   console.log(`❌ Missing settings: ${missing.join(", ")}`);
   console.log("   Add them as GitHub secrets (or to your local .env file).");
@@ -62,6 +73,9 @@ const DISCOGS_BASE = process.env.DISCOGS_API_BASE || "https://api.discogs.com";
 const SHOPIFY_BASE =
   process.env.SHOPIFY_API_BASE ||
   `https://${process.env.SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}`;
+const SHOPIFY_AUTH_URL =
+  process.env.SHOPIFY_AUTH_URL ||
+  `https://${process.env.SHOPIFY_STORE}/admin/oauth/access_token`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -143,13 +157,55 @@ function qs(params) {
 const shopify = axios.create({
   baseURL: SHOPIFY_BASE,
   headers: {
-    "X-Shopify-Access-Token": process.env.SHOPIFY_TOKEN,
     "Content-Type": "application/json",
   },
   timeout: 30000,
 });
 
 addRetry(shopify, "Shopify");
+
+// Gets a fresh Shopify token (valid 24h) from the app's Client ID/Secret,
+// and checks the token has every permission the sync needs.
+const NEEDED_SCOPES = ["read_products", "write_products", "read_orders"];
+
+async function connectShopify() {
+  if (USE_CLIENT_CREDENTIALS) {
+    let res;
+    try {
+      res = await axios.post(
+        SHOPIFY_AUTH_URL,
+        new URLSearchParams({
+          grant_type: "client_credentials",
+          client_id: process.env.SHOPIFY_CLIENT_ID,
+          client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+        }).toString(),
+        { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 30000 }
+      );
+    } catch (err) {
+      const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+      throw new Error(
+        `Shopify wouldn't issue a token (${err.response?.status || "network error"}: ${detail}). ` +
+        "Check SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET match the app's Settings page in the " +
+        "Shopify Dev Dashboard, and that the app is installed on the store."
+      );
+    }
+    shopify.defaults.headers["X-Shopify-Access-Token"] = res.data.access_token;
+    const granted = String(res.data.scope || "").split(",").map((s) => s.trim());
+    console.log(`Shopify: got a fresh access token (scopes: ${granted.join(", ") || "unknown"})`);
+
+    // write_X implies read_X in Shopify
+    const has = (s) => granted.includes(s) || granted.includes(s.replace(/^read_/, "write_"));
+    const lacking = NEEDED_SCOPES.filter((s) => !has(s));
+    if (res.data.scope && lacking.length) {
+      throw new Error(
+        `The Shopify app is missing permission(s): ${lacking.join(", ")}. ` +
+        "Add them in a new app version in the Dev Dashboard, release it, and approve it on the store."
+      );
+    }
+  } else {
+    shopify.defaults.headers["X-Shopify-Access-Token"] = process.env.SHOPIFY_TOKEN;
+  }
+}
 
 function nextPageInfo(res) {
   const link = res.headers?.link || res.headers?.Link;
@@ -221,7 +277,13 @@ async function fetchListingIdsSoldOnShopify() {
       fields: "id,name,cancelled_at,line_items",
     });
   } catch (err) {
-    if (err.response?.status === 403 || err.response?.status === 401) {
+    if (err.response?.status === 401) {
+      throw new Error(
+        "Shopify rejected the access token (401) — it's invalid or expired. " +
+        "Use SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET secrets so a fresh token is fetched every run."
+      );
+    }
+    if (err.response?.status === 403) {
       throw new Error(
         "Shopify refused access to orders. In your Shopify app's API settings, " +
         "turn on the read_orders permission, then update the SHOPIFY_TOKEN secret if it changed."
@@ -517,6 +579,8 @@ async function removeProductsNotForSale(forSaleSkus, allProducts) {
 async function main() {
   console.log(`Discogs <-> Shopify sync — ${new Date().toISOString()}`);
   if (DRY_RUN) console.log("🧪 DRY RUN — nothing will be changed");
+
+  await connectShopify();
 
   // 1. Shopify sales -> Discogs (runs first, so those listings drop out of
   //    "For Sale" and their Shopify products are removed in step 3).
