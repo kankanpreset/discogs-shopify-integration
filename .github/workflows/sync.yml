@@ -2,10 +2,10 @@ name: Discogs <-> Shopify sync
 
 on:
   schedule:
-    # Every 30 minutes. If this repo is PUBLIC, you can change this to
-    # "*/15 * * * *" for every 15 minutes (public repos get free minutes).
+    # Every 15 minutes (fine for a public repo). If you make the repo
+    # PRIVATE, change this to "*/30 * * * *" to stay within free minutes.
     # GitHub sometimes starts scheduled runs a few minutes late.
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"
 
   # Adds a "Run workflow" button on the Actions tab.
   workflow_dispatch:
@@ -50,6 +50,8 @@ jobs:
           DISCOGS_ACCESS_SECRET: ${{ secrets.DISCOGS_ACCESS_SECRET }}
           DISCOGS_USER: ${{ secrets.DISCOGS_USER }}
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
           ALLOW_MASS_DELETE: ${{ inputs.allow_mass_delete }}
